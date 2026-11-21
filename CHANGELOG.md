@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Starting a second copy now raises the window that is already open instead of opening another one, and a socket left behind by a crash is cleared on the next start.
+- The menu entry uses one application category, so it no longer shows up twice in menus that group both.
+
 ## 1.0.0
 
 - Split the single script into an installable `processfreezer` package with `docs/` and `pyproject.toml`. `./install.sh` creates the virtualenv, installs the `process-freezer` command and adds the menu entry.

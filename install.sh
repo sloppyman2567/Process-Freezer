@@ -33,7 +33,7 @@ Comment=Briefly pause one of your processes
 Exec=$bin_dir/process-freezer
 Icon=utilities-system-monitor
 Terminal=false
-Categories=Utility;System;
+Categories=System;
 Keywords=freeze;pause;process;cgroup;
 EOF
 
