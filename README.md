@@ -19,7 +19,7 @@ You need Python 3.10 or newer, PyQt6, and a Linux system with cgroup v2 and a sy
 Pick a process from the list, choose how long to pause it, then press **Freeze selected**. The pause ends when the time is up, or immediately with **Resume now**.
 
 - **Hold** keeps the process frozen while you hold the button, and resumes it when you let go.
-- **Bind** sets a global hotkey that freezes the saved process from anywhere. It needs KDE's shortcut service; see [docs/usage.md](docs/usage.md#if-the-hotkey-does-not-work).
+- **Bind** sets a global hotkey that freezes the saved process from anywhere. It needs KDE's shortcut service; on other desktops bind the command `process-freezer --freeze` in your desktop's own keyboard settings. See [docs/usage.md](docs/usage.md#if-the-hotkey-does-not-work).
 - **Theme** switches between System, Light and Dark. System follows your desktop's colour scheme.
 
 Theme, duration, hold setting, hotkey and window size are remembered in `~/.config/ProcessFreezer/ProcessFreezer.conf`, and the process the hotkey targets is kept in `~/.config/ProcessFreezer/target.json`.

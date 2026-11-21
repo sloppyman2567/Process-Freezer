@@ -31,8 +31,25 @@ Hotkey gestures fire once per press, not on repeats, and the app never asks the 
 
 - The global shortcut service is part of KDE. On GNOME, XFCE, sway, Hyprland and similar desktops there is nothing to register with, and the app says so in the status line. The button still works.
 - Missing PyGObject does not stop the app. It starts, freezes and thaws normally, and the status line names the package to install before the hotkey can work.
-- If KDE keeps the combination for something else, saving fails with a message naming the key. Pick another one.
+- If another app already owns the combination, saving is refused and the message names that app, so its shortcut is left alone. Pick another one.
 - The shortcut is owned by the running instance. Starting a second copy only raises the first window; it does not re-register the key.
+
+### Binding a key with your desktop instead
+
+Without KDE's shortcut service, use your desktop's own keybinding and point it at `process-freezer --freeze`. That hands the freeze to the window that is already running, or starts the app and freezes the saved target if it is not.
+
+```sh
+# GNOME: Settings -> Keyboard -> Custom Shortcuts, then use this as the command
+process-freezer --freeze
+
+# sway
+bindsym $mod+p exec process-freezer --freeze
+
+# Hyprland
+bind = SUPER, P, exec, process-freezer --freeze
+```
+
+The same command works for XFCE, i3, xbindkeys and anything else that runs a command on a key. Select the process in the window once so it is remembered; after that the key works without opening the window.
 
 ## Themes
 

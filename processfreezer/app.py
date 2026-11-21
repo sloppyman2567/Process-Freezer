@@ -4,6 +4,7 @@ import os
 import sys
 import tempfile
 
+from PyQt6.QtCore import QTimer
 from PyQt6.QtGui import QFont
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 from PyQt6.QtWidgets import QApplication
@@ -23,6 +24,10 @@ SINGLE_INSTANCE_SOCKET = os.path.join(_runtime_dir, f"process-freezer-{os.getuid
 
 
 def main():
+    # --freeze lets a desktop that cannot use KDE's shortcut service bind a key
+    # to "process-freezer --freeze" instead: hand the command to a running
+    # instance, or start up and freeze the saved target directly.
+    freeze_on_start = "--freeze" in sys.argv[1:]
     app = QApplication(sys.argv)
     app.setOrganizationName(ORGANIZATION)
     app.setApplicationName(APPLICATION)
@@ -40,7 +45,7 @@ def main():
         client = QLocalSocket()
         client.connectToServer(SINGLE_INSTANCE_SOCKET)
         if client.waitForConnected(500):
-            client.write(b"show")
+            client.write(b"freeze-saved" if freeze_on_start else b"show")
             client.flush()
             client.waitForBytesWritten(500)
             return 0
@@ -69,6 +74,8 @@ def main():
 
     server.newConnection.connect(accept_connection)
     window.show()
+    if freeze_on_start:
+        QTimer.singleShot(0, window.freeze_saved_target)
     return app.exec()
 
 

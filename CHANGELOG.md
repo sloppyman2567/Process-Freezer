@@ -4,6 +4,10 @@
 
 - Starting a second copy now raises the window that is already open instead of opening another one, and a socket left behind by a crash is cleared on the next start.
 - The menu entry uses one application category, so it no longer shows up twice in menus that group both.
+- `process-freezer --freeze` freezes the saved target from a key binding, for desktops without KDE's shortcut service such as GNOME, sway or Hyprland.
+- Changing the hotkey works now. KDE's shortcut daemon ignored every new key because the app asked it to autoload instead of to change the shortcut, and the old code reported success anyway.
+- Saving a hotkey checks what KDE actually stored, and a combination another app already owns is refused with that app's name instead of being taken from it.
+- On a desktop with no KDE shortcut service, the app explains that at startup and points at `process-freezer --freeze`, instead of showing a raw D-Bus error.
 
 ## 1.0.0
 

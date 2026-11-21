@@ -199,6 +199,10 @@ class GlobalHotkey(QObject):
     FRIENDLY_COMPONENT = "Process Freezer"
     FRIENDLY_ACTION = "Freeze saved process"
     SET_PRESENT = 2
+    # kglobalaccel only applies new keys when the caller says it is not
+    # autoloading; without this flag the call is treated as an app syncing its
+    # own stored shortcut and the current keys come back unchanged.
+    NO_AUTOLOADING = 0x4
 
     def __init__(self, on_activated, on_released, changed, error):
         super().__init__()
@@ -223,6 +227,14 @@ class GlobalHotkey(QObject):
             self.bus = None
             self.error_callback(f"Global shortcuts need a session bus: {error}")
             return
+        if not self.shortcut_service_running():
+            self.bus = None
+            self.error_callback(
+                "This desktop has no KDE shortcut service. Bind a key to the "
+                "command \"process-freezer --freeze\" in your desktop's keyboard "
+                "settings instead."
+            )
+            return
         self.context = GLib.MainContext.default()
         self.pump_timer = QTimer(self)
         self.pump_timer.timeout.connect(self.pump)
@@ -240,6 +252,42 @@ class GlobalHotkey(QObject):
     def action_id(self):
         return [self.COMPONENT, self.ACTION, self.FRIENDLY_COMPONENT, self.FRIENDLY_ACTION]
 
+    def shortcut_service_running(self):
+        try:
+            owned = self.bus.call_sync(
+                "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+                "NameHasOwner", self.GLib.Variant("(s)", (self.SERVICE,)), None,
+                self.Gio.DBusCallFlags.NONE, 1000, None,
+            ).unpack()[0]
+        except Exception:
+            return False
+        return bool(owned)
+
+    @staticmethod
+    def first_sequence(result):
+        """The chord list out of an ``a(ai)`` reply, or [] when it was empty.
+
+        PyGObject hands the array of one-field structs back as nested
+        one-tuples, so peel those before reading the chord ints.
+        """
+        value = result
+        while isinstance(value, (list, tuple)) and len(value) == 1 and isinstance(value[0], (list, tuple)):
+            value = value[0]
+        if not isinstance(value, (list, tuple)):
+            return []
+        return [int(chord) for chord in value]
+
+    def key_owner(self, chords):
+        """Friendly name of another component holding this key, if there is one."""
+        try:
+            infos = self.call("getGlobalShortcutsByKey", "(i)", (chords[0],)).unpack()[0]
+        except Exception:
+            return None
+        for info in infos:
+            if len(info) >= 4 and info[2] != self.COMPONENT:
+                return info[3] or info[2]
+        return None
+
     def pump(self):
         # iteration(False) also polls the bus socket; pending() alone cannot
         # discover a signal that has not been dispatched yet.
@@ -255,25 +303,47 @@ class GlobalHotkey(QObject):
 
     def bind(self, sequence):
         if self.bus is None:
-            self.error_callback("Global hotkeys are unavailable here, so the key was not saved.")
+            self.error_callback(
+                "Hotkeys are not available here, so the key was not saved. Bind "
+                "\"process-freezer --freeze\" in your desktop's keyboard settings instead."
+            )
             return
         keys = QKeySequence(sequence)
         chords = [int(keys[index].toCombined()) for index in range(keys.count())]
         if not chords:
             self.error_callback("Press a key before saving.")
             return
+        # kglobalaccel hands over a key that another component already owns,
+        # which quietly breaks that app's shortcut, so ask first.
+        try:
+            available = self.call(
+                "globalShortcutAvailable", "((ai)s)", ((chords,), self.COMPONENT),
+            ).unpack()[0]
+        except Exception:
+            available = True
+        if not available:
+            owner = self.key_owner(chords)
+            self.error_callback(
+                f"KDE already uses {sequence}" + (f" for {owner}" if owner else "")
+                + ". Pick another key."
+            )
+            return
         try:
             self.call("doRegister", "(as)", (self.action_id,))
             # a(ai) is an array of structs, so each key sequence must be wrapped
             # in a one-tuple; a bare list makes GLib refuse to build the variant.
-            assigned = self.call(
+            result = self.call(
                 "setShortcutKeys", "(asa(ai)u)",
-                (self.action_id, [(chords,)], self.SET_PRESENT),
-            ).unpack()[0]
+                (self.action_id, [(chords,)], self.SET_PRESENT | self.NO_AUTOLOADING),
+            ).unpack()
         except Exception as error:
             self.error_callback(str(error))
             return
-        if not any(assigned):
+        # kglobalaccel answers with the keys it actually stored, which is the
+        # old set when it refused the change. Trusting the call itself made the
+        # app claim success for keys KDE never took.
+        applied = self.first_sequence(result)
+        if applied[:len(chords)] != chords:
             self.error_callback(f"KDE kept {sequence} for something else. Pick another key.")
             return
         self.changed_callback(sequence)
