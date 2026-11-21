@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "process-freezer"
-version = "1.0.1"
+version = "1.0.2"
 description = "Briefly freeze one of your own processes with the cgroup v2 freezer"
 readme = "README.md"
 requires-python = ">=3.10"

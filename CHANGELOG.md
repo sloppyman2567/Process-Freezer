@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.0.2
 
 - The global hotkey dialog now looks like the rest of the app: a heading, a line explaining what the key does, roomy margins and a highlighted save button instead of a stock Qt popup.
 - The duration box draws its own stepper arrows, so it no longer shows a stray light box in the dark theme, and the theme dropdown shows its arrow again.
