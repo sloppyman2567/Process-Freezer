@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "process-freezer"
+version = "1.0.0"
+description = "Briefly freeze one of your own processes with the cgroup v2 freezer"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["PyQt6>=6.5"]
+keywords = ["cgroup", "freeze", "systemd", "pyqt6", "wayland"]
+classifiers = [
+    "Environment :: X11 Applications :: Qt",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Systems Administration",
+]
+
+[project.gui-scripts]
+process-freezer = "processfreezer.app:main"
+
+[tool.setuptools.packages.find]
+include = ["processfreezer*"]

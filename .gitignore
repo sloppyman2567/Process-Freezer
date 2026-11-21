@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.egg-info/
+build/
+dist/
+*.pyc
+
+# The old single-file version, kept in the tree for reference; not part of the
+# installed package (pyproject only ships processfreezer*).
+/process_freezer.py
