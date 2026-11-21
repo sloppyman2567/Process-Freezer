@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.0.1
 
 - Starting a second copy now raises the window that is already open instead of opening another one, and a socket left behind by a crash is cleared on the next start.
 - The menu entry uses one application category, so it no longer shows up twice in menus that group both.
