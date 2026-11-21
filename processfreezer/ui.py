@@ -5,7 +5,9 @@ from dataclasses import asdict, dataclass
 from string import Template
 
 from PyQt6.QtCore import QObject, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QColor, QGuiApplication, QKeySequence, QPalette
+from PyQt6.QtGui import (
+    QColor, QGuiApplication, QKeySequence, QPainter, QPainterPath, QPalette, QPen,
+)
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
     QHBoxLayout, QKeySequenceEdit, QLabel, QLineEdit, QMainWindow, QPushButton,
@@ -80,6 +82,7 @@ STYLE = Template("""
 QWidget { color: $text; font-family: 'Noto Sans', 'Inter', sans-serif; font-size: 10pt; }
 QMainWindow, QWidget#root, QDialog { background: $background; }
 QLabel#title { font-size: 19pt; font-weight: 650; }
+QLabel#dialogTitle { font-size: 13pt; font-weight: 650; }
 QLabel#muted { color: $muted; }
 QLabel#status { color: $muted; }
 QLabel#status[tone="error"] { color: $danger; }
@@ -89,7 +92,12 @@ QLineEdit, QComboBox, QDoubleSpinBox, QKeySequenceEdit {
 QLineEdit:focus, QComboBox:focus, QDoubleSpinBox:focus, QKeySequenceEdit:focus {
     border-color: $focus;
 }
-QComboBox::drop-down { border: 0; width: 18px; }
+QDoubleSpinBox { padding-right: 24px; }
+QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
+    subcontrol-origin: padding; width: 20px; border: 0; background: transparent;
+}
+QDoubleSpinBox::up-button { subcontrol-position: top right; }
+QDoubleSpinBox::down-button { subcontrol-position: bottom right; }
 QComboBox QAbstractItemView {
     background: $panel; border: 1px solid $line; outline: 0;
     selection-background-color: $selected; selection-color: $text;
@@ -175,6 +183,34 @@ def apply_theme(app, mode):
     app.setPalette(native_palette(palette))
     app.setStyleSheet(stylesheet(palette))
     return palette
+
+
+class DurationSpinBox(QDoubleSpinBox):
+    """A spin box that draws its own chevrons.
+
+    The stylesheet flattens the native stepper so it stops drawing a light
+    box on the dark field, but Qt will not draw arrow images from CSS, which
+    would leave two invisible click targets. Draw the arrows instead.
+    """
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        color = QColor(self.palette().color(QPalette.ColorRole.WindowText))
+        color.setAlpha(120 if self.isEnabled() else 70)
+        painter.setPen(QPen(
+            color, 1.5, Qt.PenStyle.SolidLine,
+            Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin,
+        ))
+        centre = self.width() - 11
+        middle = self.height() // 2
+        for y, rise in ((middle - 8, 2.0), (middle + 8, -2.0)):
+            chevron = QPainterPath()
+            chevron.moveTo(centre - 3.5, y + rise)
+            chevron.lineTo(centre, y - rise)
+            chevron.lineTo(centre + 3.5, y + rise)
+            painter.drawPath(chevron)
 
 
 # ---------------------------------------------------------------------- global hotkey
@@ -426,6 +462,12 @@ class ProcessFreezerWindow(QMainWindow):
 
         self.table = QTableWidget(0, 4)
         self.table.setHorizontalHeaderLabels(["PROCESS", "PID", "MEMORY", "STATE"])
+        # Headers line up with their cells: names are left, numbers right.
+        for column in range(4):
+            alignment = (
+                Qt.AlignmentFlag.AlignLeft if column == 0 else Qt.AlignmentFlag.AlignRight
+            ) | Qt.AlignmentFlag.AlignVCenter
+            self.table.horizontalHeaderItem(column).setTextAlignment(alignment)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -441,7 +483,7 @@ class ProcessFreezerWindow(QMainWindow):
         controls = QHBoxLayout()
         controls.setSpacing(8)
         controls.addWidget(QLabel("Duration"))
-        self.duration = QDoubleSpinBox()
+        self.duration = DurationSpinBox()
         self.duration.setRange(MIN_DURATION_MS, MAX_DURATION_MS)
         self.duration.setSingleStep(50)
         self.duration.setSuffix(" ms")
@@ -572,6 +614,10 @@ class ProcessFreezerWindow(QMainWindow):
                 self.table.setItem(row, column, item)
             if target_key and process.key == target_key:
                 self.table.selectRow(row)
+        if not target_key:
+            # Nothing is saved yet, so no row should look selected.
+            self.table.clearSelection()
+            self.table.setCurrentCell(-1, -1)
         self.table.blockSignals(False)
         self.update_selection()
 
@@ -706,10 +752,21 @@ class ProcessFreezerWindow(QMainWindow):
     def set_hotkey(self):
         current = self.hotkey_label.text()
         dialog = QDialog(self)
-        dialog.setWindowTitle("Bind background hotkey")
-        dialog.setMinimumWidth(350)
+        dialog.setWindowTitle("Global hotkey")
+        dialog.setMinimumWidth(430)
         form = QVBoxLayout(dialog)
-        form.addWidget(QLabel("Press the key combination to freeze the saved process."))
+        form.setContentsMargins(22, 20, 22, 18)
+        form.setSpacing(11)
+        heading = QLabel("Global hotkey")
+        heading.setObjectName("dialogTitle")
+        form.addWidget(heading)
+        hint = QLabel(
+            "Press the combination that freezes the saved process while you are in "
+            "another app. KDE's shortcut service listens for it."
+        )
+        hint.setObjectName("muted")
+        hint.setWordWrap(True)
+        form.addWidget(hint)
         capture = QKeySequenceEdit(dialog)
         capture.setKeySequence(QKeySequence(current if current != "Not set" else "Ctrl+Alt+P"))
         form.addWidget(capture)
@@ -717,8 +774,16 @@ class ProcessFreezerWindow(QMainWindow):
             QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Save,
             parent=dialog,
         )
+        save_button = buttons.button(QDialogButtonBox.StandardButton.Save)
+        save_button.setText("Save hotkey")
+        save_button.setObjectName("primary")
+        # Renaming a widget does not re-run the stylesheet selectors on it.
+        save_button.style().unpolish(save_button)
+        save_button.style().polish(save_button)
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("Cancel")
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
+        form.addSpacing(2)
         form.addWidget(buttons)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return

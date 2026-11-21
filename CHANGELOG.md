@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- The global hotkey dialog now looks like the rest of the app: a heading, a line explaining what the key does, roomy margins and a highlighted save button instead of a stock Qt popup.
+- The duration box draws its own stepper arrows, so it no longer shows a stray light box in the dark theme, and the theme dropdown shows its arrow again.
+
 ## 1.0.1
 
 - Starting a second copy now raises the window that is already open instead of opening another one, and a socket left behind by a crash is cleared on the next start.
