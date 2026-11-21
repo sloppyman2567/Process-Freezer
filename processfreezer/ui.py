@@ -313,6 +313,32 @@ class GlobalHotkey(QObject):
             return []
         return [int(chord) for chord in value]
 
+    @staticmethod
+    def sequence_text(chords):
+        # KDE pads every key sequence with zero slots, which are not chords.
+        return ", ".join(
+            QKeySequence(chord).toString(QKeySequence.SequenceFormat.PortableText)
+            for chord in chords if chord
+        )
+
+    def current_sequence(self, register=False):
+        """The keys KDE has stored for our action.
+
+        ``""`` means KDE says there are none; ``None`` means KDE could not be
+        asked, so callers should keep what they already know.
+        """
+        if self.bus is None:
+            return None
+        try:
+            if register:
+                self.call("doRegister", "(as)", (self.action_id,))
+            chords = self.first_sequence(
+                self.call("shortcutKeys", "(as)", (self.action_id,)).unpack()
+            )
+        except Exception:
+            return None
+        return self.sequence_text(chords)
+
     def key_owner(self, chords):
         """Friendly name of another component holding this key, if there is one."""
         try:
@@ -380,7 +406,8 @@ class GlobalHotkey(QObject):
         # app claim success for keys KDE never took.
         applied = self.first_sequence(result)
         if applied[:len(chords)] != chords:
-            self.error_callback(f"KDE kept {sequence} for something else. Pick another key.")
+            kept = self.sequence_text(applied) or "another key"
+            self.error_callback(f"KDE kept {kept}. Pick another key.")
             return
         self.changed_callback(sequence)
 
@@ -521,9 +548,14 @@ class ProcessFreezerWindow(QMainWindow):
             self.freeze_saved_target, self.hotkey_released,
             self.set_hotkey_label, self.show_error,
         )
-        if self.config.hotkey:
-            self.hotkey.bind(self.config.hotkey)
-            self.hotkey_button.setText("Change")
+        # KDE stores the binding, so it decides which key is active. Pushing our
+        # saved key here used to override a binding the user had changed or
+        # cleared in System Settings, which made the old key look "remembered".
+        stored = self.hotkey.current_sequence(register=True)
+        if stored is not None:
+            self.config.hotkey = stored
+        self.hotkey_label.setText(self.config.hotkey or "Not set")
+        self.hotkey_button.setText("Change" if self.config.hotkey else "Bind")
 
         hints = QApplication.instance().styleHints()
         if hasattr(hints, "colorSchemeChanged"):
@@ -534,6 +566,19 @@ class ProcessFreezerWindow(QMainWindow):
         self.refresh_timer.setInterval(1800)
         self.refresh_timer.timeout.connect(self.refresh)
         self.refresh_timer.start()
+
+    def sync_hotkey(self):
+        """Adopt a binding changed in System Settings.
+
+        kglobalaccel sends no signal when the key changes, so the periodic
+        refresh asks it instead; the call is local and costs almost nothing.
+        """
+        stored = self.hotkey.current_sequence()
+        if stored is None or stored == self.config.hotkey:
+            return
+        self.config.hotkey = stored
+        self.hotkey_label.setText(stored or "Not set")
+        self.hotkey_button.setText("Change" if stored else "Bind")
 
     def set_status(self, message, tone="muted"):
         self.status.setText(message)
@@ -555,6 +600,7 @@ class ProcessFreezerWindow(QMainWindow):
         self.config.hold_mode = checked
 
     def refresh(self):
+        self.sync_hotkey()
         selected = self.selected_process()
         self.processes = {p.pid: p for p in list_processes()}
         self.render_rows()

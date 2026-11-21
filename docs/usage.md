@@ -27,6 +27,8 @@ The key is registered with KDE's global shortcut service, which is what makes it
 
 Hotkey gestures fire once per press, not on repeats, and the app never asks the system to swallow the key.
 
+KDE stores the binding, so it is the one that decides which key is active. If you change or clear the shortcut in System Settings, the window follows it, even while it is open, instead of putting the old key back.
+
 ### If the hotkey does not work
 
 - The global shortcut service is part of KDE. On GNOME, XFCE, sway, Hyprland and similar desktops there is nothing to register with, and the app says so in the status line. The button still works.
@@ -69,7 +71,7 @@ Everything is stored in `~/.config/ProcessFreezer/ProcessFreezer.conf` (or `$XDG
 | `theme` | `system`, `light` or `dark` |
 | `duration_ms` | last used pause length |
 | `hold_mode` | whether Hold was ticked |
-| `hotkey` | the bound key sequence, empty if none |
+| `hotkey` | the key the app last saw in KDE's settings, for display only |
 | `geometry` | window size and position |
 
 The saved target lives next door in `target.json`, with the PID, start time, name and duration.

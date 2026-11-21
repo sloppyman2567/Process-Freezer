@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- The app no longer puts back an old hotkey at startup. KDE's shortcut settings are the source of truth, and the window follows a key you change or clear there, even while it is open.
+
 ## 1.0.2
 
 - The global hotkey dialog now looks like the rest of the app: a heading, a line explaining what the key does, roomy margins and a highlighted save button instead of a stock Qt popup.
