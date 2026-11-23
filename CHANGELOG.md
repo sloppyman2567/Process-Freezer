@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- The process list is a tree now, and each row carries its app's icon: children sit under the process that started them, and selecting an app freezes everything below it. **Tree** switches back to the flat list, and the choice is remembered.
+- The tree starts at your apps instead of at `systemd`. Everything in the session descends from the manager, so the old view hid the desktop shell, the browser and every other app behind one huge row that could not be frozen. Roots that share one systemd app unit now share a row named from the desktop entry, so a Flatpak app appears once instead of once per `bwrap` root, and the hotkey finds such a row again by its unit rather than by a PID.
+- Freezing an app costs one `systemctl` call and one watchdog, however many processes the tree holds, and a failure part-way thaws what already froze instead of leaving half an app stopped.
+- The filter keeps the parents of a match so a renderer still shows its app, the count beside it says how many processes are listed, and an empty result says so instead of showing a blank box. **Ctrl+F**, **Esc**, **F5** and double-clicking a row now work.
+- KDE no longer keeps using Process Freezer's shortcut after the window closes. Starting the app registered the action with the shortcut service again on every launch, and nothing released it, so KDE went on grabbing the key (a bare `Insert`, for example) while the app was not running. The key is now taken when the window opens and given back when it closes, and starting the app adds nothing to KDE's shortcut settings until you save a key.
+- The thaw watchdog started as an inline `python -c` command, which a bundled executable cannot run. It is now its own module, and the packaged build starts it through a hidden `--watchdog` flag.
 - The app no longer puts back an old hotkey at startup. KDE's shortcut settings are the source of truth, and the window follows a key you change or clear there, even while it is open.
 
 ## 1.0.2

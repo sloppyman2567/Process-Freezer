@@ -24,6 +24,12 @@ SINGLE_INSTANCE_SOCKET = os.path.join(_runtime_dir, f"process-freezer-{os.getuid
 
 
 def main():
+    # --watchdog runs the thaw safety net without any of the window set-up.
+    # It exists for the packaged build, which has no interpreter to start the
+    # watchdog with; see core.watchdog_command.
+    if "--watchdog" in sys.argv[1:]:
+        from .watchdog import main as run_watchdog
+        return run_watchdog(sys.argv[sys.argv.index("--watchdog") + 1:])
     # --freeze lets a desktop that cannot use KDE's shortcut service bind a key
     # to "process-freezer --freeze" instead: hand the command to a running
     # instance, or start up and freeze the saved target directly.

@@ -6,7 +6,7 @@ import re
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from PyQt6.QtCore import QByteArray, QSettings
@@ -37,6 +37,9 @@ class Process:
     start_time: int
     cgroup: str
     frozen: bool
+    # 0 when the parent is not ours to see: init, another user's process, or a
+    # parent that exited before this scan.
+    ppid: int = 0
 
     @property
     def key(self):
@@ -74,7 +77,7 @@ def read_process(pid):
         end = stat.rfind(")")
         name = stat[stat.find("(") + 1:end]
         fields = stat[end + 2:].split()
-        state, start_time = fields[0], int(fields[19])
+        state, ppid, start_time = fields[0], int(fields[1]), int(fields[19])
         with open(f"/proc/{pid}/status", encoding="utf-8") as file:
             status = file.read().splitlines()
         uid = int(next(line for line in status if line.startswith("Uid:")).split()[1])
@@ -83,7 +86,7 @@ def read_process(pid):
         rss = next((line for line in status if line.startswith("VmRSS:")), None)
         group = cgroup_path(pid)
         return Process(pid, name, state, int(rss.split()[1]) // 1024 if rss else 0,
-                       start_time, group, is_frozen(group))
+                       start_time, group, is_frozen(group), ppid)
     except (OSError, ValueError, StopIteration, IndexError):
         return None
 
@@ -97,21 +100,168 @@ def list_processes():
     return sorted(processes, key=lambda process: process.name.casefold())
 
 
+# The init process. Every app in the session descends from it, so the tree
+# starts at its children rather than at one enormous row.
+MANAGERS = frozenset({"systemd", "init"})
+UNIT_ESCAPE = re.compile(r"\\x([0-9a-fA-F]{2})")
+
+
+def unit_of(cgroup):
+    """The systemd unit that names the app a process runs in, or ``""``.
+
+    A cgroup path looks like
+    ``/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.kde.konsole-4004.scope/main.scope``.
+    The first unit below the per-user manager is the one the launcher made for
+    the app. Units that belong to the session itself — the manager, the login
+    session — name no app, so those processes are shown on their own.
+    """
+    for part in cgroup.split("/"):
+        if part.endswith(".service") and part.startswith("user@"):
+            continue
+        if part == "init.scope" or part.startswith("session-"):
+            continue
+        if part.endswith((".service", ".scope")):
+            return part
+    return ""
+
+
+def app_id(unit):
+    """The desktop app id inside an app unit, such as ``org.kde.konsole``.
+
+    systemd escapes characters that are not allowed in a unit name, so
+    ``app-brave\\x2dorigin@….service`` names the app ``brave-origin``.
+    """
+    stem = unit.rsplit(".", 1)[0]
+    if not stem.startswith("app-"):
+        return ""
+    stem = stem[len("app-"):].removeprefix("flatpak-").split("@", 1)[0]
+    stem = UNIT_ESCAPE.sub(lambda match: chr(int(match.group(1), 16)), stem)
+    return re.sub(r"-\d+$", "", stem).strip()
+
+
+@dataclass
+class TreeNode:
+    """A process and the processes it started, nested the way the app shows them.
+
+    ``process`` is empty for a row that gathers several roots of one app.
+    """
+
+    process: Process | None = None
+    children: list = field(default_factory=list)
+    unit: str = ""
+
+    @property
+    def size(self):
+        return (0 if self.process is None else 1) + sum(child.size for child in self.children)
+
+    def members(self):
+        """This process, then everything below it, parents before children."""
+        if self.process is not None:
+            yield self.process
+        for child in self.children:
+            yield from child.members()
+
+
+def _leads_to(nodes, start, pid):
+    """Whether following ``start`` up the parent chain comes back to ``pid``."""
+    seen = set()
+    current = start
+    while current is not None and current.process.pid not in seen:
+        if current.process.pid == pid:
+            return True
+        seen.add(current.process.pid)
+        current = nodes.get(current.process.ppid)
+    return False
+
+
+def build_forest(processes):
+    """Nest ``processes`` by parent and return the roots.
+
+    A process whose parent is missing from ``processes`` starts a tree of its
+    own: the parent may have exited, run as another user, or be a kernel
+    thread. PID reuse can also leave two processes naming each other as
+    parent, so a parent is only used when following it upwards cannot come
+    back to the child.
+    """
+    nodes = {process.pid: TreeNode(process) for process in processes}
+    roots = []
+    for process in processes:
+        node = nodes[process.pid]
+        parent = nodes.get(process.ppid)
+        if parent is None or parent is node or _leads_to(nodes, parent, node.process.pid):
+            roots.append(node)
+        else:
+            parent.children.append(node)
+    return roots
+
+
+def app_forest(processes):
+    """The rows the tree view starts from: one per app, not one per manager.
+
+    Every process descends from the session's systemd, so nesting from it put
+    all of them, apps included, below a single row that is useless to select.
+    The manager is left out and its children become the top level. A launcher
+    such as bubblewrap can leave several roots inside one app unit, and those
+    share a row, so the app appears once instead of once per root.
+    """
+    roots = []
+    for node in build_forest(processes):
+        if node.process.name in MANAGERS:
+            roots.extend(node.children)
+        else:
+            roots.append(node)
+    units = {}
+    for node in roots:
+        units.setdefault(unit_of(node.process.cgroup), []).append(node)
+    forest = []
+    for unit, nodes in units.items():
+        if unit and len(nodes) > 1:
+            forest.append(TreeNode(None, nodes, unit))
+        else:
+            forest.extend(nodes)
+    return forest
+
+
+def filter_forest(roots, keep):
+    """Drop what ``keep`` rejects, but hold on to the parents leading to a match."""
+    kept = []
+    for node in roots:
+        children = filter_forest(node.children, keep)
+        if children or (node.process is not None and keep(node.process)):
+            kept.append(TreeNode(node.process, children, node.unit))
+    return kept
+
+
+def subtree(processes, root):
+    """``root`` and everything below it, as a fresh scan of ``processes`` sees it."""
+    stack = list(build_forest(processes))
+    while stack:
+        node = stack.pop()
+        if node.process.key == root.key:
+            return list(node.members())
+        stack.extend(node.children)
+    return [root]
+
+
+def watchdog_command(units, seconds):
+    """How to start the thaw safety net for ``units``, one or many.
+
+    A source checkout runs :mod:`processfreezer.watchdog` with this
+    interpreter. A PyInstaller build has no interpreter left to run ``-m``
+    with, so the same code sits behind the app's hidden ``--watchdog`` flag.
+    """
+    if isinstance(units, str):
+        units = [units]
+    if getattr(sys, "frozen", False):
+        command = [sys.executable, "--watchdog"]
+    else:
+        command = [sys.executable, "-m", "processfreezer.watchdog"]
+    return [*command, *units, str(seconds)]
+
+
 class Freezer:
     manager = ["org.freedesktop.systemd1", "/org/freedesktop/systemd1",
                "org.freedesktop.systemd1.Manager"]
-
-    # The watchdog sleeps only after the parent writes b"start", which happens
-    # once systemctl freeze has returned. Its stdin closing without that byte
-    # means the GUI died before the freeze finished, so it thaws at once.
-    WATCHDOG = (
-        "import subprocess, sys, time\n"
-        "unit, seconds = sys.argv[1], sys.argv[2]\n"
-        "if sys.stdin.buffer.read(5) == b'start':\n"
-        "    time.sleep(float(seconds))\n"
-        "subprocess.run(['systemctl', '--user', 'thaw', unit],\n"
-        "               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
-    )
 
     @staticmethod
     def run(args, timeout=8):
@@ -123,48 +273,108 @@ class Freezer:
             raise RuntimeError((result.stderr or result.stdout).strip() or f"{args[0]} failed")
         return result.stdout.strip()
 
-    def pause(self, process, seconds):
-        current = read_process(process.pid)
-        if current is None or current.start_time != process.start_time:
-            raise RuntimeError("That process exited. Refresh the list and try again.")
-        if current.state in {"T", "t"}:
-            raise RuntimeError("That process is already paused.")
-        unit = current.scope or f"process-freezer-{current.pid}-{current.start_time}.scope"
-        if not current.scope:
-            self.run([
-                "busctl", "--user", "call", *self.manager, "StartTransientUnit",
-                "ssa(sv)a(sa(sv))", unit, "fail", "2", "Description", "s",
-                f"Process Freezer target {current.name} ({current.pid})",
-                "PIDs", "au", "1", str(current.pid), "0",
-            ])
-            for _ in range(30):
-                current = read_process(process.pid)
-                if current is None or current.start_time != process.start_time:
-                    raise RuntimeError("Process exited while preparing its freezer scope.")
-                if current.scope == unit:
-                    break
-                time.sleep(.05)
-            else:
-                raise RuntimeError("systemd did not create the process freezer scope.")
-        watchdog = subprocess.Popen(
-            [sys.executable, "-c", self.WATCHDOG, unit, str(seconds)],
-            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True,
-        )
+    def ensure_scope(self, process):
+        """The freezer scope holding ``process``, creating one if it has none.
+
+        Moving a process into a scope of its own is the expensive step, and
+        systemd answers before the move has landed, so wait until /proc reports
+        the new scope instead of freezing the old cgroup.
+        """
+        if process.scope:
+            return process.scope
+        unit = f"process-freezer-{process.pid}-{process.start_time}.scope"
+        self.run([
+            "busctl", "--user", "call", *self.manager, "StartTransientUnit",
+            "ssa(sv)a(sa(sv))", unit, "fail", "2", "Description", "s",
+            f"Process Freezer target {process.name} ({process.pid})",
+            "PIDs", "au", "1", str(process.pid), "0",
+        ])
+        for _ in range(30):
+            current = read_process(process.pid)
+            if current is None or current.start_time != process.start_time:
+                raise RuntimeError(f"{process.name} exited while preparing its freezer scope.")
+            if current.scope == unit:
+                return unit
+            time.sleep(.05)
+        raise RuntimeError("systemd did not create the process freezer scope.")
+
+    def pause(self, processes, seconds):
+        """Freeze every process in ``processes`` for ``seconds``.
+
+        Each process gets a scope of its own, then a single systemctl call
+        freezes them all, so an app with thirty children costs one freeze
+        instead of thirty.
+        """
+        targets = []
+        for process in processes:
+            current = read_process(process.pid)
+            if current is None or current.start_time != process.start_time:
+                if len(processes) == 1:
+                    raise RuntimeError("That process exited. Refresh the list and try again.")
+                # A child can exit between the scan and the freeze: freeze the
+                # rest rather than refusing the tree the user asked for.
+                continue
+            if current.state in {"T", "t"}:
+                continue
+            targets.append(current)
+        if not targets:
+            raise RuntimeError(
+                "That process is already paused." if len(processes) == 1
+                else "Those processes are already paused."
+            )
+        units, watchdogs = [], []
         try:
-            self.run(["systemctl", "--user", "freeze", unit])
+            units = [self.ensure_scope(target) for target in targets]
+            # One watchdog for the whole freeze: a tree can hold dozens of
+            # scopes, and one process per scope would cost more memory than
+            # the app being frozen.
+            watchdogs = [subprocess.Popen(
+                watchdog_command(units, seconds),
+                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True,
+            )]
+            self.run(["systemctl", "--user", "freeze", *units], timeout=30)
         except Exception:
-            # EOF makes it thaw straight away, in case the freeze landed anyway.
-            self._close_input(watchdog)
+            # A half-frozen tree is worse than none of it: put back whatever
+            # landed before giving up.
+            self.thaw_quietly(units)
+            for watchdog in watchdogs:
+                self.stop_watchdog(watchdog)
             raise
         # Start the countdown only now: the freeze already cost a systemctl
         # spawn and a D-Bus round trip, and that time must not come off the pause.
+        for watchdog in watchdogs:
+            try:
+                watchdog.stdin.write(b"start")
+                watchdog.stdin.close()
+            except OSError:
+                pass
+        return Freeze(self, units, watchdogs)
+
+    def thaw(self, units):
+        if not units:
+            return
+        self.run(["systemctl", "--user", "thaw", *units], timeout=30)
+
+    def thaw_quietly(self, units):
+        if not units:
+            return
         try:
-            watchdog.stdin.write(b"start")
-            watchdog.stdin.close()
-        except OSError:
+            self.thaw(units)
+        except Exception:
             pass
-        return unit, watchdog
+
+    @staticmethod
+    def stop_watchdog(watchdog):
+        if watchdog is None:
+            return
+        if watchdog.poll() is None:
+            watchdog.terminate()
+            try:
+                watchdog.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                watchdog.kill()
+        Freezer._close_input(watchdog)
 
     @staticmethod
     def _close_input(watchdog):
@@ -175,15 +385,19 @@ class Freezer:
         except OSError:
             pass
 
-    def resume(self, unit, watchdog=None):
-        if watchdog and watchdog.poll() is None:
-            watchdog.terminate()
-            try:
-                watchdog.wait(timeout=1)
-            except subprocess.TimeoutExpired:
-                watchdog.kill()
-        self._close_input(watchdog)
-        self.run(["systemctl", "--user", "thaw", unit])
+
+class Freeze:
+    """What one press froze, and the safety net that thaws it without the window."""
+
+    def __init__(self, freezer, units, watchdogs):
+        self.freezer = freezer
+        self.units = units
+        self.watchdogs = watchdogs
+
+    def resume(self):
+        self.freezer.thaw(self.units)
+        for watchdog in self.watchdogs:
+            self.freezer.stop_watchdog(watchdog)
 
 
 class Config:
@@ -249,6 +463,14 @@ class Config:
     @hold_mode.setter
     def hold_mode(self, value):
         self.settings.setValue("hold_mode", bool(value))
+
+    @property
+    def tree_view(self):
+        return bool(self.settings.value("tree_view", True, type=bool))
+
+    @tree_view.setter
+    def tree_view(self, value):
+        self.settings.setValue("tree_view", bool(value))
 
     @property
     def geometry(self):

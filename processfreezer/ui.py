@@ -1,21 +1,28 @@
 """Everything on screen: colour themes, the global shortcut and the main window."""
 
+import os
 import re
+import shlex
+import sys
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from string import Template
 
 from PyQt6.QtCore import QObject, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import (
-    QColor, QGuiApplication, QKeySequence, QPainter, QPainterPath, QPalette, QPen,
+    QColor, QGuiApplication, QIcon, QKeySequence, QPainter, QPainterPath, QPalette, QPen,
+    QShortcut,
 )
 from PyQt6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
-    QHBoxLayout, QKeySequenceEdit, QLabel, QLineEdit, QMainWindow, QPushButton,
-    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
+    QDoubleSpinBox, QHBoxLayout, QHeaderView, QKeySequenceEdit, QLabel, QLineEdit,
+    QMainWindow, QPushButton, QStackedWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
+    QWidget,
 )
 
 from .core import (
-    MAX_DURATION_MS, MIN_DURATION_MS, Freezer, TargetStore, list_processes, read_process,
+    MAX_DURATION_MS, MIN_DURATION_MS, Freezer, TargetStore, TreeNode, app_forest, app_id,
+    filter_forest, list_processes, read_process, subtree, unit_of,
 )
 
 
@@ -113,16 +120,16 @@ QPushButton#primary:hover { background: $accent_hover; border-color: $accent_hov
 QPushButton#primary:disabled {
     background: $accent_disabled; color: $accent_disabled_text; border-color: $accent_disabled;
 }
-QTableWidget {
+QTreeWidget, QLabel#empty {
     background: $panel; border: 1px solid $line; border-radius: 8px;
-    gridline-color: $line; selection-background-color: $selected; selection-color: $text;
+    selection-background-color: $selected; selection-color: $text;
     outline: 0;
 }
 QHeaderView::section {
     background: $background; color: $muted; border: 0; border-bottom: 1px solid $line;
     padding: 8px; font-size: 8pt; font-weight: 600;
 }
-QTableWidget::item { padding: 6px; border: 0; }
+QTreeWidget::item { padding: 6px 2px; border: 0; }
 QCheckBox { spacing: 7px; }
 QScrollBar:vertical { background: transparent; width: 8px; margin: 0; }
 QScrollBar::handle:vertical { background: $scroll; border-radius: 4px; min-height: 24px; }
@@ -215,6 +222,18 @@ class DurationSpinBox(QDoubleSpinBox):
 
 # ---------------------------------------------------------------------- global hotkey
 
+def shortcut_command():
+    """The command a desktop keybinding should run.
+
+    A frozen build has no interpreter and cannot see the system PyGObject, so
+    its only route to a global hotkey is a desktop shortcut that runs the
+    executable itself with ``--freeze``.
+    """
+    if getattr(sys, "frozen", False):
+        return f"{sys.executable} --freeze"
+    return "process-freezer --freeze"
+
+
 class GlobalHotkey(QObject):
     """Register the freeze shortcut with KDE's global shortcut daemon.
 
@@ -240,20 +259,31 @@ class GlobalHotkey(QObject):
     # own stored shortcut and the current keys come back unchanged.
     NO_AUTOLOADING = 0x4
 
-    def __init__(self, on_activated, on_released, changed, error):
+    def __init__(self, on_activated, on_released, changed, error, notice=None):
         super().__init__()
         self.activated.connect(on_activated)
         self.released.connect(on_released)
         self.changed_callback = changed
         self.error_callback = error
+        # For conditions that are a limitation rather than a mistake, such as
+        # a frozen build that cannot see PyGObject at all: those get a plain
+        # status line instead of a red error.
+        self.notice_callback = notice or error
         self.bus = None
         try:
             from gi.repository import Gio, GLib
         except ImportError:
-            self.error_callback(
-                "Global hotkeys need PyGObject; install python-gobject "
-                "(or your distribution's equivalent)."
-            )
+            if getattr(sys, "frozen", False):
+                self.notice_callback(
+                    "Global hotkeys are not built into this executable. Bind "
+                    f"\"{shortcut_command()}\" to a key in your desktop's "
+                    "keyboard settings instead."
+                )
+            else:
+                self.error_callback(
+                    "Global hotkeys need PyGObject; install python-gobject "
+                    "(or your distribution's equivalent)."
+                )
             return
         self.Gio, self.GLib = Gio, GLib
         self.component_path = "/component/" + re.sub(r"[^A-Za-z0-9_]", "_", self.COMPONENT)
@@ -267,7 +297,7 @@ class GlobalHotkey(QObject):
             self.bus = None
             self.error_callback(
                 "This desktop has no KDE shortcut service. Bind a key to the "
-                "command \"process-freezer --freeze\" in your desktop's keyboard "
+                f"command \"{shortcut_command()}\" in your desktop's keyboard "
                 "settings instead."
             )
             return
@@ -367,7 +397,7 @@ class GlobalHotkey(QObject):
         if self.bus is None:
             self.error_callback(
                 "Hotkeys are not available here, so the key was not saved. Bind "
-                "\"process-freezer --freeze\" in your desktop's keyboard settings instead."
+                f"\"{shortcut_command()}\" in your desktop's keyboard settings instead."
             )
             return
         keys = QKeySequence(sequence)
@@ -411,6 +441,37 @@ class GlobalHotkey(QObject):
             return
         self.changed_callback(sequence)
 
+    def activate(self, sequence):
+        """Take KDE's stored key for as long as this instance runs.
+
+        kglobalacceld forgets that an action is present when it restarts, so a
+        key it still has stored would never fire again. Autoloading (no
+        NO_AUTOLOADING flag) means this only marks the action present: the key
+        KDE already has stays the one in use, and nothing is written back.
+        """
+        if self.bus is None:
+            return
+        keys = QKeySequence(sequence)
+        chords = [int(keys[index].toCombined()) for index in range(keys.count())]
+        if not chords:
+            return
+        try:
+            self.call(
+                "setShortcutKeys", "(asa(ai)u)",
+                (self.action_id, [(chords,)], self.SET_PRESENT),
+            )
+        except Exception:
+            pass
+
+    def deactivate(self):
+        """Give the key back, so KDE stops using it while the app is closed."""
+        if self.bus is None:
+            return
+        try:
+            self.call("setInactive", "(as)", (self.action_id,))
+        except Exception:
+            pass
+
     def pressed(self, _connection, _sender, _path, _interface, _signal, parameters, _user_data):
         _component, action, _timestamp = parameters.unpack()
         if action == self.ACTION:
@@ -425,6 +486,161 @@ class GlobalHotkey(QObject):
         if getattr(self, "pump_timer", None) is not None:
             self.pump_timer.stop()
         self.bus = None
+
+
+# ---------------------------------------------------------------------- app icons
+
+ICON_FALLBACK = "application-x-executable"
+
+
+def icon_directories():
+    """Where desktop entries live, in the order a desktop reads them."""
+    home = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    system = (os.environ.get("XDG_DATA_DIRS") or "/usr/local/share:/usr/share").split(":")
+    return [Path(directory) / "applications" for directory in (home, *system) if directory]
+
+
+def exec_program(command):
+    """The executable an ``Exec=`` line runs, without arguments or field codes."""
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return None
+    # Many entries start with env and its variables: Exec=env FOO=1 app %U.
+    while tokens and (tokens[0] == "env" or re.fullmatch(r"[A-Za-z_]\w*=\S*", tokens[0])):
+        tokens = tokens[1:]
+    for token in tokens:
+        if not token.startswith("%"):
+            return os.path.basename(token)
+    return None
+
+
+class AppIcons:
+    """Icons for processes, taken from the desktop entry that launches them.
+
+    A process carries no icon of its own, so the closest honest source is the
+    ``.desktop`` file whose ``Exec=`` runs the same executable: its ``Icon=``
+    is what the menu shows for the app. The directories are scanned once,
+    because they change far more rarely than the process list does.
+    """
+
+    def __init__(self):
+        self.entries = None
+        self.identities = None
+        self.cache = {}
+
+    def icon_for(self, process):
+        program = self.executable(process.pid) or process.name
+        if program not in self.cache:
+            self.cache[program] = self.lookup(program)
+        return self.cache[program]
+
+    def identity(self, app, fallback):
+        """The name and icon to show for an app, from its desktop entry.
+
+        The entry's ``Name=`` is what the menu shows. The app id is a readable
+        fallback, and the process name the last resort.
+        """
+        name, icon_name = (self.apps().get(app) if app else None) or ("", "")
+        icon = self.first_icon(icon_name) if icon_name else QIcon()
+        if icon.isNull() and fallback is not None:
+            icon = self.icon_for(fallback)
+        return name or app or (fallback.name if fallback is not None else ""), icon
+
+    def lookup(self, program):
+        return self.first_icon(self.programs().get(program, ""), program)
+
+    @staticmethod
+    def first_icon(name, program=""):
+        candidates = []
+        if name and "/" in name:
+            # An entry may name a file instead of a theme icon, but only when
+            # that file is actually there.
+            if Path(name).exists():
+                candidates.append(QIcon(name))
+        elif name:
+            candidates.append(QIcon.fromTheme(name))
+        if program:
+            candidates.append(QIcon.fromTheme(program))
+        candidates.append(QIcon.fromTheme(ICON_FALLBACK))
+        for icon in candidates:
+            if not icon.isNull():
+                return icon
+        # A theme without the fallback: an empty icon still beats a broken one.
+        return QIcon()
+
+    def apps(self):
+        """Desktop id -> (name, icon), straight from the menu entries."""
+        self.programs()
+        return self.identities
+
+    def programs(self):
+        """Executable name -> the icon its desktop entry names.
+
+        Several entries can run the same binary, and a shared interpreter such
+        as python3 is launched by many unrelated apps. Only an entry named
+        after the binary, or a set of entries that agree on one icon, is trusted:
+        a wrong icon is worse than the generic one.
+        """
+        if self.entries is not None:
+            return self.entries
+        candidates = {}
+        self.identities = {}
+        for directory in icon_directories():
+            for path in sorted(directory.glob("*.desktop")):
+                found = self.read_entry(path)
+                if not found:
+                    continue
+                program, icon, name = found
+                self.identities.setdefault(path.stem, (name, icon))
+                if icon:
+                    candidates.setdefault(program, []).append((path.stem, icon))
+        self.entries = {}
+        for program, found in candidates.items():
+            named = [icon for stem, icon in found if stem.casefold() == program.casefold()]
+            icons = {icon for _stem, icon in found}
+            if named:
+                self.entries[program] = named[0]
+            elif len(icons) == 1:
+                self.entries[program] = icons.pop()
+        return self.entries
+
+    @staticmethod
+    def read_entry(path):
+        program = icon = name = None
+        try:
+            with open(path, encoding="utf-8", errors="replace") as file:
+                section = None
+                for line in file:
+                    line = line.strip()
+                    if line.startswith("["):
+                        if section == "[Desktop Entry]":
+                            break
+                        section = line
+                        continue
+                    if section != "[Desktop Entry]" or "=" not in line:
+                        continue
+                    key, value = line.split("=", 1)
+                    if key == "Exec":
+                        program = exec_program(value)
+                    elif key == "Icon":
+                        icon = value.strip()
+                    elif key == "Name":
+                        name = value.strip()
+        except OSError:
+            return None
+        if not program or not icon:
+            return None
+        return program, icon, name
+
+    @staticmethod
+    def executable(pid):
+        try:
+            target = os.readlink(f"/proc/{pid}/exe")
+        except OSError:
+            return None
+        # An updated or deleted binary keeps its path plus a suffix.
+        return os.path.basename(target.removesuffix(" (deleted)")) or None
 
 
 # ---------------------------------------------------------------------- main window
@@ -481,31 +697,69 @@ class ProcessFreezerWindow(QMainWindow):
         layout.addLayout(header)
 
         search_row = QHBoxLayout()
+        search_row.setSpacing(8)
         self.search = QLineEdit()
         self.search.setPlaceholderText("Filter processes…")
         self.search.textChanged.connect(self.render_rows)
-        search_row.addWidget(self.search)
+        search_row.addWidget(self.search, 1)
+
+        self.count_label = QLabel("")
+        self.count_label.setObjectName("muted")
+        search_row.addWidget(self.count_label)
+
+        self.tree_view = QCheckBox("Tree")
+        self.tree_view.setToolTip(
+            "Nest each process's children under it and freeze them together"
+        )
+        self.tree_view.setChecked(self.config.tree_view)
+        self.tree_view.toggled.connect(self.change_view)
+        search_row.addWidget(self.tree_view)
         layout.addLayout(search_row)
 
-        self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["PROCESS", "PID", "MEMORY", "STATE"])
+        # The app icon each row shows, and the trees the user has collapsed.
+        self.app_icons = AppIcons()
+        self.collapsed = set()
+
+        self.tree = QTreeWidget()
+        self.tree.setColumnCount(4)
+        self.tree.setHeaderLabels(["PROCESS", "PID", "MEMORY", "STATE"])
         # Headers line up with their cells: names are left, numbers right.
         for column in range(4):
             alignment = (
                 Qt.AlignmentFlag.AlignLeft if column == 0 else Qt.AlignmentFlag.AlignRight
             ) | Qt.AlignmentFlag.AlignVCenter
-            self.table.horizontalHeaderItem(column).setTextAlignment(alignment)
-        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
-        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.table.verticalHeader().hide()
-        header_view = self.table.horizontalHeader()
+            self.tree.headerItem().setTextAlignment(column, alignment)
+        self.tree.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.tree.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.tree.setRootIsDecorated(True)
+        self.tree.setUniformRowHeights(True)
+        self.tree.setIndentation(16)
+        header_view = self.tree.header()
         header_view.setStretchLastSection(False)
-        header_view.setSectionResizeMode(0, header_view.ResizeMode.Stretch)
+        header_view.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         for column, width in ((1, 80), (2, 100), (3, 90)):
-            self.table.setColumnWidth(column, width)
-        self.table.itemSelectionChanged.connect(self.selection_changed)
-        layout.addWidget(self.table, 1)
+            self.tree.setColumnWidth(column, width)
+        self.tree.itemSelectionChanged.connect(self.selection_changed)
+        self.tree.itemDoubleClicked.connect(self.double_clicked)
+        self.tree.itemExpanded.connect(self.node_expanded)
+        self.tree.itemCollapsed.connect(self.node_collapsed)
+
+        self.empty_label = QLabel("")
+        self.empty_label.setObjectName("empty")
+        self.empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.empty_label.setWordWrap(True)
+        self.view = QStackedWidget()
+        self.view.addWidget(self.tree)
+        self.view.addWidget(self.empty_label)
+        layout.addWidget(self.view, 1)
+
+        for keys, slot in (
+            (QKeySequence.StandardKey.Find, self.search.setFocus),
+            (QKeySequence("Escape"), self.clear_filter),
+            (QKeySequence("F5"), self.refresh),
+        ):
+            QShortcut(QKeySequence(keys), self).activated.connect(slot)
 
         controls = QHBoxLayout()
         controls.setSpacing(8)
@@ -542,20 +796,32 @@ class ProcessFreezerWindow(QMainWindow):
 
         self.status = QLabel("Select a process, bind a hotkey, then trigger a timed pause in the background.")
         self.status.setObjectName("status")
+        # Some messages, notably the command to bind a shortcut, name a full
+        # path and do not fit on one line.
+        self.status.setWordWrap(True)
         layout.addWidget(self.status)
 
         self.hotkey = GlobalHotkey(
             self.freeze_saved_target, self.hotkey_released,
-            self.set_hotkey_label, self.show_error,
+            self.set_hotkey_label, self.show_error, self.show_notice,
         )
-        # KDE stores the binding, so it decides which key is active. Pushing our
-        # saved key here used to override a binding the user had changed or
-        # cleared in System Settings, which made the old key look "remembered".
-        stored = self.hotkey.current_sequence(register=True)
+        # KDE stores the binding, so it decides which key is active. Only ask it
+        # about the key: registering here re-created Process Freezer in KDE's
+        # shortcut settings on every launch, whether or not a key was bound.
+        stored = self.hotkey.current_sequence()
         if stored is not None:
             self.config.hotkey = stored
-        self.hotkey_label.setText(self.config.hotkey or "Not set")
-        self.hotkey_button.setText("Change" if self.config.hotkey else "Bind")
+        # Take the key while the window is open. Closing the window gives it
+        # back, so KDE does not go on swallowing a shortcut for an app that is
+        # not running.
+        if stored:
+            self.hotkey.activate(stored)
+        # A key is only worth showing when something can deliver it: without a
+        # shortcut service, naming a stored key would promise a hotkey that
+        # does not fire.
+        shown = self.config.hotkey if self.hotkey.bus is not None else ""
+        self.hotkey_label.setText(shown or "Not set")
+        self.hotkey_button.setText("Change" if shown else "Bind")
 
         hints = QApplication.instance().styleHints()
         if hasattr(hints, "colorSchemeChanged"):
@@ -601,15 +867,8 @@ class ProcessFreezerWindow(QMainWindow):
 
     def refresh(self):
         self.sync_hotkey()
-        selected = self.selected_process()
-        self.processes = {p.pid: p for p in list_processes()}
+        self.processes = {process.pid: process for process in list_processes()}
         self.render_rows()
-        if selected and selected.pid in self.processes and self.processes[selected.pid].key == selected.key:
-            for row in range(self.table.rowCount()):
-                if int(self.table.item(row, 1).text()) == selected.pid:
-                    self.table.selectRow(row)
-                    break
-        self.update_selection()
 
     def write_target(self):
         if not self.saved_target:
@@ -624,97 +883,295 @@ class ProcessFreezerWindow(QMainWindow):
         self.config.duration_ms = int(value)
         self.write_target()
 
+    def change_view(self, checked):
+        self.config.tree_view = checked
+        self.render_rows()
+
+    def clear_filter(self):
+        self.search.clear()
+
+    @staticmethod
+    def node_id(item):
+        """What a row is remembered by: its PID, or the unit of a gathered app."""
+        key = item.data(0, Qt.ItemDataRole.UserRole)
+        if key:
+            return key[0]
+        return item.data(0, Qt.ItemDataRole.UserRole + 1)
+
+    def node_expanded(self, item):
+        identifier = self.node_id(item)
+        if identifier:
+            self.collapsed.discard(identifier)
+
+    def node_collapsed(self, item):
+        identifier = self.node_id(item)
+        if identifier:
+            self.collapsed.add(identifier)
+
+    def double_clicked(self, item, _column):
+        # The row under the pointer is what the user means, not whatever was
+        # selected before the click.
+        self.tree.setCurrentItem(item)
+        self.freeze_selected()
+
+    @staticmethod
+    def describe(members, label=None):
+        name = label or members[0].name
+        if len(members) == 1:
+            return name
+        return f"{name} and {len(members) - 1} more processes"
+
+    def current_label(self):
+        item = self.tree.currentItem()
+        return item.text(0) if item is not None else None
+
     def selection_changed(self):
-        process = self.selected_process()
+        item = self.tree.currentItem()
+        members = self.selected_members()
+        process = members[0] if members else None
         if process:
-            self.saved_target = {
+            unit = item.data(0, Qt.ItemDataRole.UserRole + 1) if item is not None else None
+            label = item.text(0) if item is not None else process.name
+            target = {
                 "pid": process.pid,
                 "start_time": process.start_time,
-                "name": process.name,
+                "name": label,
                 "duration": self.duration.value() / 1000,
+                # Remember whether the hotkey should take the whole tree or
+                # just this process the next time it fires.
+                "tree": len(members) > 1,
             }
+            if unit:
+                # A gathered app is remembered by its unit: its processes come
+                # and go, and the hotkey looks them up again when it fires.
+                target["unit"] = unit
+            self.saved_target = target
             self.write_target()
-            self.set_status(f"Saved target: {process.name} ({process.pid}).")
+            where = "" if unit else f" ({process.pid})"
+            self.set_status(f"Saved target: {self.describe(members, label)}{where}.")
         self.update_selection()
+
+    def app_row(self, node):
+        """The row that gathers every root one app unit holds."""
+        members = list(node.members())
+        label, icon = self.app_icons.identity(
+            app_id(node.unit), members[0] if members else None
+        )
+        frozen = any(member.scope and member.frozen for member in members)
+        state = "Frozen" if frozen else (
+            "Paused" if any(member.state in {"T", "t"} for member in members) else "Running"
+        )
+        item = QTreeWidgetItem([
+            label, "", f"{sum(member.memory_mb for member in members)} MB", state,
+        ])
+        item.setData(0, Qt.ItemDataRole.UserRole + 1, node.unit)
+        item.setIcon(0, icon)
+        item.setToolTip(0, f"{label} · {len(members)} processes in this app")
+        return item
+
+    def add_node(self, parent, node):
+        if node.process is None:
+            item = self.app_row(node)
+            identifier = node.unit
+        else:
+            process = node.process
+            state = "Frozen" if process.frozen and process.scope else (
+                "Paused" if process.state in {"T", "t"} else "Running"
+            )
+            item = QTreeWidgetItem(
+                [process.name, str(process.pid), f"{process.memory_mb} MB", state]
+            )
+            item.setData(0, Qt.ItemDataRole.UserRole, process.key)
+            item.setIcon(0, self.app_icons.icon_for(process))
+            item.setToolTip(0, f"{process.name} ({process.pid})" + (
+                f" · {node.size} processes in this tree" if node.children else ""
+            ))
+            identifier = process.pid
+        for column in (1, 2, 3):
+            item.setTextAlignment(column, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        if parent is None:
+            self.tree.addTopLevelItem(item)
+        else:
+            parent.addChild(item)
+        for child in node.children:
+            self.add_node(item, child)
+        if node.children:
+            # Open unless the user closed this tree, so a refresh does not
+            # reopen what they collapsed.
+            item.setExpanded(identifier not in self.collapsed)
+        return node.size
+
+    def item_for(self, key):
+        stack = [self.tree.topLevelItem(row) for row in range(self.tree.topLevelItemCount())]
+        while stack:
+            item = stack.pop()
+            if item.data(0, Qt.ItemDataRole.UserRole) == key:
+                return item
+            stack.extend(item.child(row) for row in range(item.childCount()))
+        return None
+
+    def select_key(self, key):
+        item = self.item_for(key)
+        if item is None:
+            return False
+        parent = item.parent()
+        while parent is not None:
+            parent.setExpanded(True)
+            parent = parent.parent()
+        self.tree.setCurrentItem(item)
+        self.tree.scrollToItem(item)
+        return True
+
+    def select_unit(self, unit):
+        for row in range(self.tree.topLevelItemCount()):
+            item = self.tree.topLevelItem(row)
+            if item.data(0, Qt.ItemDataRole.UserRole + 1) == unit:
+                self.tree.setCurrentItem(item)
+                self.tree.scrollToItem(item)
+                return True
+        return False
+
+    @staticmethod
+    def matches(process, query):
+        return query in process.name.casefold() or query in str(process.pid)
 
     def render_rows(self, *_):
         selected = self.selected_process()
         target_key = selected.key if selected else (
-            (self.saved_target["pid"], self.saved_target["start_time"])
+            (self.saved_target["pid"], int(self.saved_target["start_time"]))
             if self.saved_target else None
         )
+        current = self.tree.currentItem()
+        unit = current.data(0, Qt.ItemDataRole.UserRole + 1) if current is not None else None
         query = self.search.text().strip().casefold()
-        self.table.blockSignals(True)
-        self.table.setRowCount(0)
-        for process in self.processes.values():
-            if query and query not in process.name.casefold() and query not in str(process.pid):
-                continue
-            row = self.table.rowCount()
-            self.table.insertRow(row)
-            state = "Frozen" if process.frozen and process.scope else "Paused" if process.state in {"T", "t"} else "Running"
-            values = (process.name, str(process.pid), f"{process.memory_mb} MB", state)
-            for column, value in enumerate(values):
-                item = QTableWidgetItem(value)
-                if column in (1, 2, 3):
-                    item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-                self.table.setItem(row, column, item)
-            if target_key and process.key == target_key:
-                self.table.selectRow(row)
-        if not target_key:
-            # Nothing is saved yet, so no row should look selected.
-            self.table.clearSelection()
-            self.table.setCurrentCell(-1, -1)
-        self.table.blockSignals(False)
+        self.tree.blockSignals(True)
+        self.tree.clear()
+        shown = 0
+        if self.tree_view.isChecked():
+            roots = app_forest(list(self.processes.values()))
+            if query:
+                # Parents stay as context for a matching child.
+                roots = filter_forest(roots, lambda process: self.matches(process, query))
+            for node in roots:
+                shown += self.add_node(None, node)
+        else:
+            for process in self.processes.values():
+                if query and not self.matches(process, query):
+                    continue
+                self.add_node(None, TreeNode(process))
+                shown += 1
+        if not (unit and self.select_unit(unit)):
+            if not target_key or not self.select_key(target_key):
+                # Nothing is saved yet, so no row should look selected.
+                self.tree.clearSelection()
+                self.tree.setCurrentItem(None)
+        self.tree.blockSignals(False)
+        total = len(self.processes)
+        self.count_label.setText(f"{shown} of {total}" if shown != total else f"{total} processes")
+        self.view.setCurrentWidget(self.tree if shown else self.empty_label)
+        if not shown:
+            text = self.search.text().strip()
+            self.empty_label.setText(
+                f"No processes match “{text}”." if text else "No processes to show."
+            )
         self.update_selection()
 
+    def item_processes(self, item):
+        members = []
+        stack = [item]
+        while stack:
+            current = stack.pop(0)
+            key = current.data(0, Qt.ItemDataRole.UserRole)
+            process = self.processes.get(key[0]) if key else None
+            # The start time is part of the key: a recycled PID is a different
+            # process, and freezing it would freeze the wrong thing.
+            if process is not None and process.key == key:
+                members.append(process)
+            stack.extend(current.child(row) for row in range(current.childCount()))
+        return members
+
+    def selected_members(self):
+        item = self.tree.currentItem()
+        return self.item_processes(item) if item is not None else []
+
     def selected_process(self):
-        row = self.table.currentRow() if hasattr(self, "table") else -1
-        if row < 0 or self.table.item(row, 1) is None:
-            return None
-        try:
-            return self.processes.get(int(self.table.item(row, 1).text()))
-        except (ValueError, AttributeError):
-            return None
+        members = self.selected_members()
+        return members[0] if members else None
 
     def update_selection(self):
-        process = self.selected_process()
-        frozen = bool(process and process.scope and process.frozen)
-        if process and self.holds_key(process.key):
+        members = self.selected_members()
+        process = members[0] if members else None
+        if process is None:
+            self.freeze_button.setText("Freeze selected")
+            self.freeze_button.setEnabled(False)
+            return
+        if self.holds_key(process.key):
             self.freeze_button.setText("Release to resume")
             self.freeze_button.setEnabled(True)
             return
-        self.freeze_button.setText("Resume now" if frozen else "Freeze selected")
-        self.freeze_button.setEnabled(process is not None and (frozen or not process.frozen and process.state not in {"T", "t"}))
+        if any(member.scope and member.frozen for member in members):
+            self.freeze_button.setText("Resume now")
+            self.freeze_button.setEnabled(True)
+            return
+        self.freeze_button.setText(
+            f"Freeze {len(members)} processes" if len(members) > 1 else "Freeze selected"
+        )
+        self.freeze_button.setEnabled(
+            not any(member.state in {"T", "t"} for member in members)
+        )
+
+    @staticmethod
+    def freezes_ourselves(members):
+        # Freezing our own tree would hang the window until the watchdog thaws
+        # it again, which looks exactly like a crash.
+        return any(member.pid == os.getpid() for member in members)
 
     def freeze_selected(self, timed=False):
         if self.hold_mode.isChecked() and not timed:
             return
-        process = self.selected_process()
-        if process is None:
+        members = self.selected_members()
+        if not members:
             return
-        if process.scope and process.frozen:
-            active = self.active.pop(process.key, None)
-            try:
-                self.freezer.resume(process.scope, active[1] if active else None)
-                if active:
-                    active[2].stop()
-                self.set_status(f"Resumed {process.name}.")
-            except Exception as error:
-                self.show_error(str(error))
-            self.refresh()
+        if self.freezes_ourselves(members):
+            self.show_error(
+                "That tree includes Process Freezer itself. Select the process "
+                "you want instead."
+            )
+            return
+        if any(member.scope and member.frozen for member in members):
+            self.resume_members(members)
             return
         seconds = self.duration.value() / 1000
         self.config.duration_ms = int(self.duration.value())
         self.freeze_button.setEnabled(False)
         try:
-            unit, watchdog = self.freezer.pause(process, seconds)
-            key = process.key
+            freeze = self.freezer.pause(members, seconds)
+            key = members[0].key
             timer = QTimer(self)
             timer.setSingleShot(True)
-            timer.timeout.connect(lambda: self.finish_pause(key, unit, watchdog))
-            self.active[key] = (unit, watchdog, timer)
+            timer.timeout.connect(lambda: self.finish_pause(key, freeze))
+            self.active[key] = (freeze, timer)
             timer.start(round(self.duration.value()))
-            self.set_status(f"Paused {process.name} for {self.duration.value():g} ms.")
+            self.set_status(
+                f"Paused {self.describe(members, self.current_label())} "
+                f"for {self.duration.value():g} ms."
+            )
+        except Exception as error:
+            self.show_error(str(error))
+        self.refresh()
+
+    def resume_members(self, members):
+        """Thaw what this window froze, or what was already frozen by hand."""
+        active = self.active.pop(members[0].key, None)
+        try:
+            if active:
+                active[0].resume()
+            else:
+                units = sorted({
+                    member.scope for member in members if member.scope and member.frozen
+                })
+                self.freezer.thaw(units)
+            self.set_status(f"Resumed {self.describe(members, self.current_label())}.")
         except Exception as error:
             self.show_error(str(error))
         self.refresh()
@@ -722,31 +1179,46 @@ class ProcessFreezerWindow(QMainWindow):
     def hold_pressed(self):
         if not self.hold_mode.isChecked():
             return
-        process = self.selected_process()
-        if process is None or process.state in {"T", "t"} or process.frozen:
+        members = self.selected_members()
+        if not members or any(self.is_stopped(member) for member in members):
             return
-        self.begin_hold(process, "Release the button to resume.", "button")
+        self.begin_hold(members, "Release the button to resume.", "button")
+
+    @staticmethod
+    def is_stopped(process):
+        return process.state in {"T", "t"} or bool(process.scope and process.frozen)
 
     def holds_key(self, key):
         return key in self.holds.values()
 
-    def begin_hold(self, process, release_hint, source):
-        if self.holds_key(process.key):
+    def begin_hold(self, members, release_hint, source):
+        key = members[0].key
+        if self.freezes_ourselves(members):
+            self.show_error(
+                "That tree includes Process Freezer itself. Select the process "
+                "you want instead."
+            )
+            return
+        if self.holds_key(key):
             # A second trigger for the same freeze: just note who else is holding
             # it, so releasing one does not resume it under the other.
-            self.holds[source] = process.key
-            self.set_status(f"Holding {process.name} paused. {release_hint}")
+            self.holds[source] = key
+            self.set_status(
+                f"Holding {self.describe(members, self.current_label())} paused. {release_hint}"
+            )
             return
         try:
             # The watchdog is a safety net if the GUI dies while held.
-            unit, watchdog = self.freezer.pause(process, 24 * 60 * 60)
+            freeze = self.freezer.pause(members, 24 * 60 * 60)
             timer = QTimer(self)
             timer.setSingleShot(True)
-            timer.timeout.connect(lambda: self.finish_pause(process.key, unit, watchdog))
+            timer.timeout.connect(lambda: self.finish_pause(key, freeze))
             timer.start(24 * 60 * 60 * 1000)
-            self.active[process.key] = (unit, watchdog, timer)
-            self.holds[source] = process.key
-            self.set_status(f"Holding {process.name} paused. {release_hint}")
+            self.active[key] = (freeze, timer)
+            self.holds[source] = key
+            self.set_status(
+                f"Holding {self.describe(members, self.current_label())} paused. {release_hint}"
+            )
         except Exception as error:
             self.show_error(str(error))
         self.refresh()
@@ -759,10 +1231,10 @@ class ProcessFreezerWindow(QMainWindow):
         active = self.active.pop(key, None)
         if not active:
             return
-        unit, watchdog, timer = active
+        freeze, timer = active
         timer.stop()
         try:
-            self.freezer.resume(unit, watchdog)
+            freeze.resume()
             self.set_status("Process resumed.")
         except Exception as error:
             self.show_error(str(error))
@@ -773,23 +1245,49 @@ class ProcessFreezerWindow(QMainWindow):
         if not target:
             self.show_error("Choose a process first; no target is saved.")
             return
-        process = read_process(int(target["pid"]))
-        if process is None or process.start_time != int(target["start_time"]):
-            self.show_error("The saved process has exited. Choose it again from the list.")
+        unit = target.get("unit")
+        if unit:
+            # A gathered app is found again by its unit: the PIDs inside it are
+            # not the ones that were selected.
+            members = [
+                process for process in list_processes()
+                if unit_of(process.cgroup) == unit
+            ]
+            if not members:
+                self.show_error(
+                    "The saved app is no longer running. Choose it again from the list."
+                )
+                return
+            process = members[0]
+        else:
+            process = read_process(int(target["pid"]))
+            if process is None or process.start_time != int(target["start_time"]):
+                self.show_error("The saved process has exited. Choose it again from the list.")
+                return
+            # The tree is rebuilt from a fresh scan rather than remembered from
+            # the selection, so children that started or exited since then are
+            # handled.
+            members = subtree(list_processes(), process) if target.get("tree") else [process]
+        if self.freezes_ourselves(members):
+            self.show_error(
+                "That tree includes Process Freezer itself. Select the process "
+                "you want instead."
+            )
             return
-        if process.scope and process.frozen or process.state in {"T", "t"}:
+        if any(member.scope and member.frozen or member.state in {"T", "t"} for member in members):
             self.show_error("The saved process is already paused.")
             return
         if self.hold_mode.isChecked():
-            self.begin_hold(process, "Release the hotkey to resume.", "hotkey")
+            self.begin_hold(members, "Release the hotkey to resume.", "hotkey")
             return
         if self.search.text():
             self.search.clear()
-        for row in range(self.table.rowCount()):
-            if int(self.table.item(row, 1).text()) == process.pid:
-                self.table.selectRow(row)
-                self.freeze_selected(timed=True)
-                return
+        if unit and self.select_unit(unit):
+            self.freeze_selected(timed=True)
+            return
+        if self.select_key(process.key):
+            self.freeze_selected(timed=True)
+            return
         self.show_error("The saved process is hidden by the current filter.")
 
     def hotkey_released(self):
@@ -850,12 +1348,12 @@ class ProcessFreezerWindow(QMainWindow):
             self.hotkey_button.setText("Change")
             self.set_status("Background hotkey is ready.")
 
-    def finish_pause(self, key, unit, watchdog):
+    def finish_pause(self, key, freeze):
         for source, held in list(self.holds.items()):
             if held == key:
                 del self.holds[source]
         try:
-            self.freezer.resume(unit, watchdog)
+            freeze.resume()
             self.set_status("Process resumed.")
         except Exception as error:
             self.show_error(str(error))
@@ -865,13 +1363,19 @@ class ProcessFreezerWindow(QMainWindow):
     def show_error(self, message):
         self.set_status(message, "error")
 
+    def show_notice(self, message):
+        self.set_status(message)
+
     def closeEvent(self, event):
         self.refresh_timer.stop()
+        # Release the grab before the window goes away: KDE otherwise keeps the
+        # shortcut active until the shortcut daemon restarts.
+        self.hotkey.deactivate()
         self.hotkey.stop()
-        for unit, watchdog, timer in self.active.values():
+        for freeze, timer in self.active.values():
             timer.stop()
             try:
-                self.freezer.resume(unit, watchdog)
+                freeze.resume()
             except Exception:
                 pass
         self.config.geometry = self.saveGeometry()
