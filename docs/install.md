@@ -43,6 +43,24 @@ Re-running the script is safe; it upgrades the existing install in place. If you
 
 Once installed, `.venv/bin/process-freezer` is the real command; the file in `~/.local/bin` is a symlink to it.
 
+## Prebuilt binary
+
+Every tagged release publishes one executable, named `process-freezer-<version>-linux-x86_64-glibc2.39`. Download it from the repository's Releases page and put it on your `PATH`:
+
+```sh
+mkdir -p ~/.local/bin
+mv process-freezer-*-linux-x86_64-glibc2.39 ~/.local/bin/process-freezer
+chmod +x ~/.local/bin/process-freezer
+```
+
+The matching `.sha256` file holds the checksum: `sha256sum -c process-freezer-<version>-linux-x86_64-glibc2.39.sha256` checks the download.
+
+It carries Python, Qt and the app, so it needs no Python install, virtualenv or `install.sh`. The system requirements are the rest of the list above: glibc 2.39 or newer (Ubuntu 24.04, Fedora 40, Arch and later), cgroup v2 and a systemd user manager.
+
+The binary is built without the global hotkey. PyGObject and KDE's shortcut service are system libraries it does not carry, so its status line says the hotkey is not part of the build and prints the command to bind: the binary's own path followed by `--freeze` ([docs/usage.md](usage.md#if-the-hotkey-does-not-work)). To get the hotkey inside the window, install from source as above.
+
+The file is a self-extracting single-file executable, so the first start takes a moment longer than later ones while it unpacks into a temporary directory.
+
 ## Uninstall
 
 ```sh
@@ -51,5 +69,7 @@ rm ~/.local/share/applications/process-freezer.desktop
 rm -rf .venv                 # and the project folder itself, if you are done
 rm -rf ~/.config/ProcessFreezer
 ```
+
+The same commands uninstall the prebuilt binary; it has no `.venv` of its own.
 
 Removing the config deletes your saved hotkey, target and theme. Leave it if you plan to reinstall.

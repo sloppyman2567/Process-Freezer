@@ -14,6 +14,8 @@ That creates `.venv`, installs the `process-freezer` command into `~/.local/bin`
 
 You need Python 3.10 or newer, PyQt6, and a Linux system with cgroup v2 and a systemd user manager. Package names for each distribution are in [docs/install.md](docs/install.md).
 
+If you would rather not install Python and PyQt6, every tagged release also publishes a single-file executable for 64-bit Linux. It needs glibc 2.39 or newer, and its global hotkey is unavailable; bind `process-freezer --freeze` to a key instead. See [docs/install.md](docs/install.md#prebuilt-binary).
+
 ## Use
 
 Pick a process from the list, choose how long to pause it, then press **Freeze selected**. The pause ends when the time is up, or immediately with **Resume now**.

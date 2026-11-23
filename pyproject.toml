@@ -18,8 +18,14 @@ classifiers = [
     "Topic :: System :: Systems Administration",
 ]
 
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
 [project.gui-scripts]
 process-freezer = "processfreezer.app:main"
 
 [tool.setuptools.packages.find]
 include = ["processfreezer*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
