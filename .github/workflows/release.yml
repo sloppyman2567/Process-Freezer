@@ -126,9 +126,20 @@ jobs:
             kill "$pid" 2>/dev/null || true
             exit 1
           fi
+          # The directory appears before it is full: the bootloader writes the
+          # files one at a time, so counting straight away sees the first entry
+          # alone. Wait for the libraries to reach a plausible number, then let
+          # the last write land before measuring.
+          libs=0
+          for _ in $(seq 120); do
+            libs=$(find "$dir" -type f -name '*.so*' 2>/dev/null | wc -l)
+            [ "$libs" -ge 10 ] && break
+            sleep 0.5
+          done
+          sleep 1
+          libs=$(find "$dir" -type f -name '*.so*' 2>/dev/null | wc -l)
           # The bundle deletes its unpacked directory on exit, so it has to be
           # measured while the app is still running.
-          libs=$(find "$dir" -type f -name '*.so*' | wc -l)
           if [ "$libs" -lt 10 ]; then
             echo "::error::Only $libs libraries unpacked; the bundle looks incomplete."
             kill "$pid" 2>/dev/null || true
