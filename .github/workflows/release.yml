@@ -179,14 +179,25 @@ jobs:
             gh release upload "$TAG" release/* --clobber
             exit 0
           fi
+          # The release notes are the changelog's section for this version.
+          # Generated notes only list merged pull requests, and this repository
+          # commits straight to main, so they would say almost nothing.
+          notes_file="$RUNNER_TEMP/notes.md"
+          awk -v v="$VERSION" '$0 == "## " v { inside = 1; next } /^## / { inside = 0 } inside' \
+            CHANGELOG.md > "$notes_file"
+          if [ -s "$notes_file" ]; then
+            notes=(--notes-file "$notes_file")
+          else
+            notes=(--generate-notes)
+          fi
           if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
             # The tag was pushed by hand, so publish exactly that commit.
             gh release create "$TAG" release/* \
-              --title "Process Freezer $VERSION" --generate-notes --verify-tag
+              --title "Process Freezer $VERSION" "${notes[@]}" --verify-tag
           else
             # Called from CI after a version bump: the tag does not exist yet,
             # so the release creates it at the commit that was built.
             gh release create "$TAG" release/* \
-              --title "Process Freezer $VERSION" --generate-notes \
+              --title "Process Freezer $VERSION" "${notes[@]}" \
               --target "$GITHUB_SHA"
           fi
