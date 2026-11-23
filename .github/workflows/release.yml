@@ -1,10 +1,21 @@
 name: Release
 
-# Every v* tag publishes one executable: a single-file ELF for 64-bit Linux,
-# built on Ubuntu 24.04 so it needs glibc 2.39 or newer.
+# One executable per release: a single-file ELF for 64-bit Linux, built on
+# Ubuntu 24.04 so it needs glibc 2.39 or newer.
+#
+# Two ways in: pushing a v* tag by hand, or the CI workflow calling this one
+# when the version in the tree is new. The second path publishes on merge and
+# creates the tag with the release, because a tag pushed with the workflow's own
+# token would not start a run of its own.
 on:
   push:
     tags: ["v*"]
+  workflow_call:
+    inputs:
+      tag:
+        description: Tag to publish, for example v1.1.0
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -18,7 +29,7 @@ jobs:
 
       - name: Check the tag matches the version
         env:
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           version=$(python3 -c "import processfreezer; print(processfreezer.__version__)")
           if [ "$TAG" != "v$version" ]; then
@@ -150,12 +161,21 @@ jobs:
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           # Re-running a failed build must not fail on the existing release.
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" release/* --clobber
-          else
+            exit 0
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            # The tag was pushed by hand, so publish exactly that commit.
             gh release create "$TAG" release/* \
               --title "Process Freezer $VERSION" --generate-notes --verify-tag
+          else
+            # Called from CI after a version bump: the tag does not exist yet,
+            # so the release creates it at the commit that was built.
+            gh release create "$TAG" release/* \
+              --title "Process Freezer $VERSION" --generate-notes \
+              --target "$GITHUB_SHA"
           fi

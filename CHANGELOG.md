@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.1.0
 
 - The process list is a tree now, and each row carries its app's icon: children sit under the process that started them, and selecting an app freezes everything below it. **Tree** switches back to the flat list, and the choice is remembered.
 - The tree starts at your apps instead of at `systemd`. Everything in the session descends from the manager, so the old view hid the desktop shell, the browser and every other app behind one huge row that could not be frozen. Roots that share one systemd app unit now share a row named from the desktop entry, so a Flatpak app appears once instead of once per `bwrap` root, and the hotkey finds such a row again by its unit rather than by a PID.
@@ -9,7 +9,7 @@
 - KDE no longer keeps using Process Freezer's shortcut after the window closes. Starting the app registered the action with the shortcut service again on every launch, and nothing released it, so KDE went on grabbing the key (a bare `Insert`, for example) while the app was not running. The key is now taken when the window opens and given back when it closes, and starting the app adds nothing to KDE's shortcut settings until you save a key.
 - Tagged releases now include a single-file 64-bit Linux executable, built on Ubuntu 24.04 and needing glibc 2.39 or newer, so the app runs without Python or PyQt6 installed. It has no global hotkey; bind `process-freezer --freeze` to a key instead.
 - The executable no longer tells you to install PyGObject, which it can never see. It says the hotkey is not part of the build and prints the exact path to bind in your desktop's keyboard settings, as a plain note rather than a red error. Without a shortcut service the window also shows **Not set** instead of a stored key that would never fire.
-- GitHub Actions runs the headless tests on every push and pull request, and builds the executable from a `v*` tag.
+- GitHub Actions runs the headless tests on every push and pull request. A push to `main` that raises the version now builds the executable and publishes the release for that version, tag included, so there is no separate tagging step to forget.
 - The thaw watchdog started as an inline `python -c` command, which a bundled executable cannot run. It is now its own module, and the packaged build starts it through a hidden `--watchdog` flag.
 - The app no longer puts back an old hotkey at startup. KDE's shortcut settings are the source of truth, and the window follows a key you change or clear there, even while it is open.
 

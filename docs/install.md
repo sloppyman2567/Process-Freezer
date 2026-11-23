@@ -45,7 +45,7 @@ Once installed, `.venv/bin/process-freezer` is the real command; the file in `~/
 
 ## Prebuilt binary
 
-Every tagged release publishes one executable, named `process-freezer-<version>-linux-x86_64-glibc2.39`. Download it from the repository's Releases page and put it on your `PATH`:
+Every release publishes one executable, named `process-freezer-<version>-linux-x86_64-glibc2.39`. GitHub Actions cuts the release as soon as a new version lands on `main`, so nothing has to be tagged by hand. Download it from the repository's Releases page and put it on your `PATH`:
 
 ```sh
 mkdir -p ~/.local/bin
